@@ -37,7 +37,7 @@ type SysConfig struct {
 	InfluxOrg              string `json:"influx_org"`
 	InfluxBucket           string `json:"influx_bucket"`
 	InfluxMeasurement      string `json:"influx_measurement"`
-	WriteCycle             int    `json:"write_cycle"`
+	WriteCycle             int    `json:"write_cycle"` // 控制Modbus从站采集的时间间隔（单位：秒），即每隔多少秒轮询一次所有配置的Modbus设备。每次采集到数据后，会立即进行处理和插入数据库，而不是控制写入数据库的批量周期。
 	DownsampledMeasurement string `json:"downsampled_measurement"`
 	DownsampleStepMinutes  int    `json:"downsample_step_minutes"`
 	RawKeepDays            int    `json:"raw_keep_days"`
@@ -307,7 +307,7 @@ func processValueForDecimal(raw interface{}, dtype string, decimal int) float64 
 
 // ========== 采集核心 ==========
 
-func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*TaskStatus, wg *sync.WaitGroup) {
+func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*TaskStatus, wg *sync.WaitGroup, influxW *InfluxWriter) {
 	defer wg.Done()
 	handler := modbus.NewTCPClientHandler(fmt.Sprintf("%s:%s", batch.IP, batch.Port))
 	handler.Timeout = 3 * time.Second
@@ -322,6 +322,7 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 			log.Printf("Batch task %s stopped", batch.GroupKey)
 			return
 		default:
+			startTime := time.Now()
 			if err := handler.Connect(); err != nil {
 				for _, cfg := range batch.Items {
 					statusMap[cfg.VarName].LastError = err
@@ -379,6 +380,7 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 				remain -= qty
 			}
 			curReg := 0
+			row := make(map[string]interface{})
 			for _, cfg := range batch.Items {
 				byteLen := 0
 				switch cfg.DataType {
@@ -412,10 +414,22 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 					statusMap[cfg.VarName].RetryCount = 0
 					v := processValueForDecimal(value, cfg.DataType, cfg.Decimal)
 					varMap.Store(cfg.VarName, v)
+					row[cfg.VarName] = v
 				}
 				curReg += int(cfg.Quantity)
 			}
-			time.Sleep(500 * time.Millisecond)
+			// 数据采集完立即写入数据库
+			if len(row) > 0 {
+				if err := influxW.WriteVars(row, startTime); err != nil {
+					log.Println("写入InfluxDB失败:", err)
+				}
+			}
+			// 等待下一个采集周期
+			elapsed := time.Since(startTime)
+			sleepTime := time.Duration(sysConfig.WriteCycle)*time.Second - elapsed
+			if sleepTime > 0 {
+				time.Sleep(sleepTime)
+			}
 		}
 	}
 }
@@ -458,7 +472,6 @@ func (iw *InfluxWriter) Close() {
 
 // ========== 采集控制/接口 ==========
 
-// 新增：采集控制核心逻辑（无写响应）
 func stopCollect() {
 	collectLock.Lock()
 	defer collectLock.Unlock()
@@ -490,36 +503,14 @@ func startCollect() error {
 	varMap = sync.Map{}
 	collectCtx, collectCancel = context.WithCancel(context.Background())
 	batches := groupConfigsForBatch(configs)
-	for _, batch := range batches {
-		collectWg.Add(1)
-		go runBatchTask(collectCtx, batch, statusMap, &collectWg)
-	}
 	if influxW != nil {
 		influxW.Close()
 	}
 	influxW = NewInfluxWriter()
-	go func(ctx context.Context) {
-		ticker := time.NewTicker(time.Duration(sysConfig.WriteCycle) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case t := <-ticker.C:
-				row := make(map[string]interface{})
-				varMap.Range(func(k, v interface{}) bool {
-					row[k.(string)] = v
-					return true
-				})
-				if len(row) > 0 {
-					err := influxW.WriteVars(row, t)
-					if err != nil {
-						log.Println("写入InfluxDB失败:", err)
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}(collectCtx)
+	for _, batch := range batches {
+		collectWg.Add(1)
+		go runBatchTask(collectCtx, batch, statusMap, &collectWg, influxW)
+	}
 	collecting = true
 	log.Printf("采集已启动")
 	return nil
@@ -721,6 +712,7 @@ func getSysConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, cfg)
 }
+
 func postSysConfigHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("postSysConfigHandler called")
 	var cfg SysConfig
@@ -731,6 +723,14 @@ func postSysConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := SaveSysConfig(SysConfigFile, &cfg); err != nil {
 		log.Printf("postSysConfigHandler save error: %v", err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	loadGlobalConfig(&cfg) // <-- 加载新配置到全局变量
+	stopCollect()          // 停止采集
+	err := startCollect()  // 重启采集
+	if err != nil {
+		log.Printf("startCollect error: %v", err)
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -849,17 +849,17 @@ func main() {
 	http.HandleFunc("/export", withCORS(exportHandler))
 	http.HandleFunc("/query", withCORS(queryHandler))
 	http.HandleFunc("/dbsize", withCORS(dbsizeHandler))
-	http.HandleFunc("/sysconfig", withCORS(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			getSysConfigHandler(w, r)
-		case http.MethodPost:
-			postSysConfigHandler(w, r)
-		default:
-			http.Error(w, "method not allowed", 405)
-		}
-	}))
-	http.HandleFunc("/upload-config", withCORS(uploadConfigExcelHandler))
+	//http.HandleFunc("/sysconfig", withCORS(func(w http.ResponseWriter, r *http.Request) {
+	//	switch r.Method {
+	//	case http.MethodGet:
+	//		getSysConfigHandler(w, r)
+	//	case http.MethodPost:
+	//		postSysConfigHandler(w, r)
+	//	default:
+	//		http.Error(w, "method not allowed", 405)
+	//	}
+	//}))
+	//http.HandleFunc("/upload-config", withCORS(uploadConfigExcelHandler))
 	http.HandleFunc("/collect-status", withCORS(collectStatusHandler))
 
 	fs := http.FileServer(http.Dir("./web"))
