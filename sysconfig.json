@@ -6,11 +6,12 @@
   "influx_org": "WCH",
   "influx_bucket": "mb_data",
   "influx_measurement": "data_center",
-  "write_cycle": 5,
+  "request_cycle": 1,
   "downsampled_measurement": "data_center",
   "downsample_step_minutes": 1,
   "raw_keep_days": 30,
   "downsample_keep_days": 200,
   "config_excel": "config.xlsx",
-  "modbus_max_regs": 125
+  "modbus_max_regs": 125,
+  "db_path": "C:\\Users\\WANGCHAO-P14S-Gen2i\\.influxdbv2\\engine"
 }

@@ -37,13 +37,14 @@ type SysConfig struct {
 	InfluxOrg              string `json:"influx_org"`
 	InfluxBucket           string `json:"influx_bucket"`
 	InfluxMeasurement      string `json:"influx_measurement"`
-	WriteCycle             int    `json:"write_cycle"` // 控制Modbus从站采集的时间间隔（单位：秒），即每隔多少秒轮询一次所有配置的Modbus设备。每次采集到数据后，会立即进行处理和插入数据库，而不是控制写入数据库的批量周期。
+	RequestCycle           int    `json:"request_cycle"` // 控制Modbus从站采集的时间间隔（单位：秒），即每隔多少秒轮询一次所有配置的Modbus设备。每次采集到数据后，会立即进行处理和插入数据库，而不是控制写入数据库的批量周期。
 	DownsampledMeasurement string `json:"downsampled_measurement"`
 	DownsampleStepMinutes  int    `json:"downsample_step_minutes"`
 	RawKeepDays            int    `json:"raw_keep_days"`
 	DownsampleKeepDays     int    `json:"downsample_keep_days"`
 	ConfigExcel            string `json:"config_excel"`
 	ModbusMaxRegs          int    `json:"modbus_max_regs"`
+	DbPath                 string `json:"db_path"`
 }
 
 var sysConfig SysConfig
@@ -426,7 +427,7 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 			}
 			// 等待下一个采集周期
 			elapsed := time.Since(startTime)
-			sleepTime := time.Duration(sysConfig.WriteCycle)*time.Second - elapsed
+			sleepTime := time.Duration(sysConfig.RequestCycle)*time.Second - elapsed
 			if sleepTime > 0 {
 				time.Sleep(sleepTime)
 			}
@@ -687,7 +688,7 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 // ========== 其它接口 ==========
 
 func dbsizeHandler(w http.ResponseWriter, r *http.Request) {
-	dbPath := "./influxdb_data"
+	dbPath := sysConfig.DbPath
 	log.Printf("dbsizeHandler called, dbPath=%s", dbPath)
 	var total int64
 	filepath.Walk(dbPath, func(path string, info os.FileInfo, err error) error {
@@ -849,17 +850,6 @@ func main() {
 	http.HandleFunc("/export", withCORS(exportHandler))
 	http.HandleFunc("/query", withCORS(queryHandler))
 	http.HandleFunc("/dbsize", withCORS(dbsizeHandler))
-	//http.HandleFunc("/sysconfig", withCORS(func(w http.ResponseWriter, r *http.Request) {
-	//	switch r.Method {
-	//	case http.MethodGet:
-	//		getSysConfigHandler(w, r)
-	//	case http.MethodPost:
-	//		postSysConfigHandler(w, r)
-	//	default:
-	//		http.Error(w, "method not allowed", 405)
-	//	}
-	//}))
-	//http.HandleFunc("/upload-config", withCORS(uploadConfigExcelHandler))
 	http.HandleFunc("/collect-status", withCORS(collectStatusHandler))
 
 	fs := http.FileServer(http.Dir("./web"))
