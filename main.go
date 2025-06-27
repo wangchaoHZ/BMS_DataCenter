@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -143,7 +144,6 @@ func parseExcelConfig(filename string) ([]Config, error) {
 		if i == 0 {
 			continue
 		}
-		// 为了兼容原有行为，最低8列，但Label在第二列，所以要>=9列
 		if len(row) < 9 {
 			log.Printf("Row %d too short: %v", i, row)
 			continue
@@ -410,7 +410,6 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 					statusMap[cfg.VarName].LastSuccess = time.Now()
 					statusMap[cfg.VarName].LastError = nil
 					statusMap[cfg.VarName].RetryCount = 0
-					// ========== Decimal规则在这里应用 ==========
 					v := processValueForDecimal(value, cfg.DataType, cfg.Decimal)
 					varMap.Store(cfg.VarName, v)
 				}
@@ -459,20 +458,29 @@ func (iw *InfluxWriter) Close() {
 
 // ========== 采集控制/接口 ==========
 
-func startCollectHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("startCollectHandler called")
+// 新增：采集控制核心逻辑（无写响应）
+func stopCollect() {
+	collectLock.Lock()
+	defer collectLock.Unlock()
+	if !collecting {
+		return
+	}
+	collectCancel()
+	collectWg.Wait()
+	collecting = false
+	log.Printf("采集已停止")
+}
+func startCollect() error {
 	collectLock.Lock()
 	defer collectLock.Unlock()
 	if collecting {
 		log.Printf("Already collecting")
-		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "already collecting"})
-		return
+		return nil
 	}
 	cfgs, err := parseExcelConfig(sysConfig.ConfigExcel)
 	if err != nil {
 		log.Printf("parseExcelConfig failed: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": "parse config failed", "detail": err.Error()})
-		return
+		return err
 	}
 	configs = cfgs
 	statusMap = make(map[string]*TaskStatus)
@@ -514,22 +522,22 @@ func startCollectHandler(w http.ResponseWriter, r *http.Request) {
 	}(collectCtx)
 	collecting = true
 	log.Printf("采集已启动")
+	return nil
+}
+
+func startCollectHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("startCollectHandler called")
+	err := startCollect()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"error": "parse config failed", "detail": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "started"})
 }
 
 func stopCollectHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("stopCollectHandler called")
-	collectLock.Lock()
-	defer collectLock.Unlock()
-	if !collecting {
-		log.Printf("Not running")
-		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "not running"})
-		return
-	}
-	collectCancel()
-	collectWg.Wait()
-	collecting = false
-	log.Printf("采集已停止")
+	stopCollect()
 	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "stopped"})
 }
 
@@ -586,7 +594,6 @@ func exportHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "result error: "+result.Err().Error(), 500)
 		return
 	}
-	// 时间排序
 	var times []string
 	for t := range rows {
 		times = append(times, t)
@@ -596,9 +603,7 @@ func exportHandler(w http.ResponseWriter, r *http.Request) {
 	f := excelize.NewFile()
 	sheet := "Sheet1"
 	f.SetSheetName(f.GetSheetName(0), sheet)
-	// 设置第一列宽度为20
 	f.SetColWidth(sheet, "A", "A", 20)
-	// 冻结第一行
 	f.SetPanes(sheet, &excelize.Panes{
 		Freeze:      true,
 		Split:       false,
@@ -607,7 +612,6 @@ func exportHandler(w http.ResponseWriter, r *http.Request) {
 		TopLeftCell: "A2",
 		ActivePane:  "bottomLeft",
 	})
-	// 写表头（用Label字段）
 	f.SetCellValue(sheet, "A1", "time")
 	for i, cfg := range configs {
 		col, _ := excelize.ColumnNumberToName(i + 2)
@@ -617,8 +621,6 @@ func exportHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		f.SetCellValue(sheet, fmt.Sprintf("%s1", col), label)
 	}
-
-	// 数据部分
 	for i, t := range times {
 		f.SetCellValue(sheet, fmt.Sprintf("A%d", i+2), t)
 		for j, cfg := range configs {
@@ -734,24 +736,6 @@ func postSysConfigHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]string{"msg": "ok"})
 }
-func reloadConfigAndRestartHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("reloadConfigAndRestartHandler called")
-	var cfg SysConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		log.Printf("reloadConfigAndRestartHandler decode error: %v", err)
-		http.Error(w, "Invalid config", 400)
-		return
-	}
-	if err := SaveSysConfig(SysConfigFile, &cfg); err != nil {
-		log.Printf("reloadConfigAndRestartHandler save error: %v", err)
-		http.Error(w, "Failed to save config", 500)
-		return
-	}
-	loadGlobalConfig(&cfg)
-	stopCollectHandler(w, r)
-	startCollectHandler(w, r)
-	writeJSON(w, 200, map[string]string{"msg": "采集服务已重启并按新配置运行"})
-}
 
 func parseFlexibleTime(str string) (time.Time, error) {
 	log.Printf("parseFlexibleTime input: %s", str)
@@ -779,6 +763,69 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	}
 }
 
+// ========== 上传采集配置文件并自动热重载接口 ==========
+func uploadConfigExcelHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "file required", 400)
+		return
+	}
+	defer file.Close()
+	dstPath := sysConfig.ConfigExcel
+	if dstPath == "" {
+		dstPath = "config.xlsx"
+	}
+	out, err := os.Create(dstPath)
+	if err != nil {
+		http.Error(w, "failed to create file", 500)
+		return
+	}
+	defer out.Close()
+	_, err = io.Copy(out, file)
+	if err != nil {
+		http.Error(w, "failed to save file", 500)
+		return
+	}
+	// 停止并重启采集（不写多次响应）
+	stopCollect()
+	cfgs, err := parseExcelConfig(dstPath)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"msg": "解析Excel失败: " + err.Error()})
+		return
+	}
+	configs = cfgs
+	err = startCollect()
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"msg": "采集重启失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"msg": "配置上传并已按新配置采集"})
+}
+
+func collectStatusHandler(w http.ResponseWriter, r *http.Request) {
+	status := map[string]interface{}{
+		"collecting": collecting, // 直接用已有的 collecting 全局变量
+	}
+	writeJSON(w, 200, status)
+}
+
+func withCORS(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		handler(w, r)
+	}
+}
+
 // ========== main ==========
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -796,12 +843,13 @@ func main() {
 	}
 	statusMap = make(map[string]*TaskStatus)
 
-	http.HandleFunc("/start", startCollectHandler)
-	http.HandleFunc("/stop", stopCollectHandler)
-	http.HandleFunc("/export", exportHandler)
-	http.HandleFunc("/query", queryHandler)
-	http.HandleFunc("/dbsize", dbsizeHandler)
-	http.HandleFunc("/sysconfig", func(w http.ResponseWriter, r *http.Request) {
+	// 在 main() 里注册路由时这样写
+	http.HandleFunc("/start", withCORS(startCollectHandler))
+	http.HandleFunc("/stop", withCORS(stopCollectHandler))
+	http.HandleFunc("/export", withCORS(exportHandler))
+	http.HandleFunc("/query", withCORS(queryHandler))
+	http.HandleFunc("/dbsize", withCORS(dbsizeHandler))
+	http.HandleFunc("/sysconfig", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			getSysConfigHandler(w, r)
@@ -810,8 +858,9 @@ func main() {
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
-	})
-	http.HandleFunc("/reload-config", reloadConfigAndRestartHandler)
+	}))
+	http.HandleFunc("/upload-config", withCORS(uploadConfigExcelHandler))
+	http.HandleFunc("/collect-status", withCORS(collectStatusHandler))
 
 	fs := http.FileServer(http.Dir("./web"))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -825,6 +874,6 @@ func main() {
 
 	addr := fmt.Sprintf("%s:%d", sysConfig.ServerIP, sysConfig.ServerPort)
 	fmt.Printf("[INFO] 数据中心服务已启动，监听 %s\n", addr)
-	fmt.Println("API: /start /stop /export /query /dbsize /sysconfig /reload-config")
+	fmt.Println("API: /start /stop /export /query /dbsize /sysconfig /upload-config")
 	log.Fatal(http.ListenAndServe(addr, nil))
 }

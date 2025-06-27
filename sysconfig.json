@@ -1,6 +1,6 @@
 {
-  "server_ip": "0.0.0.0",
-  "server_port": 8080,
+  "server_ip": "192.168.1.111",
+  "server_port": 8088,
   "influx_url": "http://localhost:8086",
   "influx_token": "k7x0Wkcsecz3SkZ3pJzn7ZPhK-78rByElbShL4yNaYhUBuVlEV19FPhq0krEfkHH_-aMzAg2s_QxykOyphm6RQ==",
   "influx_org": "WCH",
