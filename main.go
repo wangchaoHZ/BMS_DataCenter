@@ -22,6 +22,7 @@ import (
 	"github.com/goburrow/modbus"
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	"github.com/influxdata/influxdb-client-go/v2/api"
+	"github.com/lestrrat-go/file-rotatelogs"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -643,13 +644,19 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	tsStr := r.URL.Query().Get("ts")
 	log.Printf("queryHandler called, var=%s ts=%s", varName, tsStr)
 	if varName == "" || tsStr == "" {
-		http.Error(w, "var/ts required", 400)
+		writeJSON(w, 400, map[string]interface{}{
+			"error": "var/ts required",
+			"msg":   "参数不完整，请检查变量名(var)和时间(ts)是否填写。",
+		})
 		return
 	}
 	ts, err := parseFlexibleTime(tsStr)
 	if err != nil {
 		log.Printf("parseFlexibleTime error: %v", err)
-		http.Error(w, "bad ts format", 400)
+		writeJSON(w, 400, map[string]interface{}{
+			"error": "bad ts format",
+			"msg":   "时间格式错误，请输入正确的时间格式。",
+		})
 		return
 	}
 	start := ts.Add(-30 * time.Second)
@@ -666,7 +673,10 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	result, err := client.QueryAPI(sysConfig.InfluxOrg).Query(r.Context(), q)
 	if err != nil {
 		log.Printf("Influx QueryAPI failed: %v", err)
-		http.Error(w, "query failed: "+err.Error(), 500)
+		writeJSON(w, 500, map[string]interface{}{
+			"error": "query failed",
+			"msg":   "数据库查询失败，请稍后再试或联系管理员。",
+		})
 		return
 	}
 	var rows []map[string]interface{}
@@ -678,11 +688,25 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.Err() != nil {
 		log.Printf("Influx result error: %v", result.Err())
-		http.Error(w, "result error: "+result.Err().Error(), 500)
+		writeJSON(w, 500, map[string]interface{}{
+			"error": "result error",
+			"msg":   "数据库结果解析失败，请联系管理员。",
+		})
+		return
+	}
+	if len(rows) == 0 {
+		log.Printf("queryHandler: no data found for var=%s ts=%s", varName, tsStr)
+		writeJSON(w, 200, map[string]interface{}{
+			"msg":  "未查到对应数据，请确认变量名和时间区间是否正确。",
+			"data": []map[string]interface{}{},
+		})
 		return
 	}
 	log.Printf("queryHandler returned %d rows", len(rows))
-	writeJSON(w, 200, rows)
+	writeJSON(w, 200, map[string]interface{}{
+		"data": rows,
+		"msg":  "查询成功",
+	})
 }
 
 // ========== 其它接口 ==========
@@ -827,8 +851,27 @@ func withCORS(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func initLog() {
+	logDir := "./logs"
+	if _, err := os.Stat(logDir); os.IsNotExist(err) {
+		os.MkdirAll(logDir, 0755)
+	}
+	writer, err := rotatelogs.New(
+		logDir+"/app.%Y-%m-%d.log",
+		//rotatelogs.WithLinkName(logDir+"/app.log"), // 软链指向最新日志
+		rotatelogs.WithMaxAge(60*24*time.Hour),    // 最多保存30天
+		rotatelogs.WithRotationTime(24*time.Hour), // 每天切分
+	)
+	if err != nil {
+		log.Fatalf("日志初始化失败: %v", err)
+	}
+	log.SetOutput(writer)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
+
 // ========== main ==========
 func main() {
+	initLog()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	cfg, err := LoadSysConfig(SysConfigFile)
 	if err != nil {
@@ -863,7 +906,8 @@ func main() {
 	})
 
 	addr := fmt.Sprintf("%s:%d", sysConfig.ServerIP, sysConfig.ServerPort)
+	log.Printf("[INFO] 数据中心服务已启动，监听 %s\n", addr)
+	log.Println("API: /start /stop /export /query /dbsize /sysconfig /upload-config")
 	fmt.Printf("[INFO] 数据中心服务已启动，监听 %s\n", addr)
-	fmt.Println("API: /start /stop /export /query /dbsize /sysconfig /upload-config")
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
