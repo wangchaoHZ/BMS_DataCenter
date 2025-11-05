@@ -93,8 +93,6 @@ var (
 	statusMap     map[string]*TaskStatus
 )
 
-// ========== 工具函数 ==========
-
 func LoadSysConfig(filename string) (*SysConfig, error) {
 	log.Printf("Loading system config from %s", filename)
 	b, err := os.ReadFile(filename)
@@ -307,8 +305,6 @@ func processValueForDecimal(raw interface{}, dtype string, decimal int) float64 
 	}
 }
 
-// ========== 采集核心 ==========
-
 func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*TaskStatus, wg *sync.WaitGroup, influxW *InfluxWriter) {
 	defer wg.Done()
 	handler := modbus.NewTCPClientHandler(fmt.Sprintf("%s:%s", batch.IP, batch.Port))
@@ -436,7 +432,7 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 	}
 }
 
-// ========== Influx写入 ==========
+// ========== InfluxDB写入 ==========
 
 type InfluxWriter struct {
 	client   influxdb2.Client
@@ -471,8 +467,6 @@ func (iw *InfluxWriter) Close() {
 	iw.client.Close()
 	log.Printf("Closed InfluxWriter")
 }
-
-// ========== 采集控制/接口 ==========
 
 func stopCollect() {
 	collectLock.Lock()
@@ -710,7 +704,6 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ========== 其它接口 ==========
-
 func dbsizeHandler(w http.ResponseWriter, r *http.Request) {
 	dbPath := sysConfig.DbPath
 	log.Printf("dbsizeHandler called, dbPath=%s", dbPath)
