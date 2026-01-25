@@ -38,7 +38,7 @@ type SysConfig struct {
 	InfluxOrg              string `json:"influx_org"`
 	InfluxBucket           string `json:"influx_bucket"`
 	InfluxMeasurement      string `json:"influx_measurement"`
-	RequestCycle           int    `json:"request_cycle"` // 控制Modbus从站采集的时间间隔（单位：秒），即每隔多少秒轮询一次所有配置的Modbus设备。每次采集到数据后，会立即进行处理和插入数据库，而不是控制写入数据库的批量周期。
+	RequestCycle           int    `json:"request_cycle"` // 控制Modbus从站采集的时间间隔
 	DownsampledMeasurement string `json:"downsampled_measurement"`
 	DownsampleStepMinutes  int    `json:"downsample_step_minutes"`
 	RawKeepDays            int    `json:"raw_keep_days"`
@@ -52,7 +52,7 @@ var sysConfig SysConfig
 
 type Config struct {
 	VarName  string
-	Label    string // 新增Label字段
+	Label    string
 	SlaveID  byte
 	IP       string
 	Port     string
@@ -91,7 +91,28 @@ var (
 	collecting    bool
 	configs       []Config
 	statusMap     map[string]*TaskStatus
+
+	// 新增：全局串口锁，防止多个协程同时操作同一个串口导致冲突
+	serialLocks sync.Map
 )
+
+// 新增：获取串口锁
+func getSerialLock(portName string) *sync.Mutex {
+	l, _ := serialLocks.LoadOrStore(portName, &sync.Mutex{})
+	return l.(*sync.Mutex)
+}
+
+// 新增：判断是否为串口地址
+func isSerialPort(addr string) bool {
+	// 简单判断：Windows下是 COM 开头，Linux/Unix 下通常是 /dev/ 或 / 开头
+	if strings.HasPrefix(strings.ToUpper(addr), "COM") {
+		return true
+	}
+	if strings.HasPrefix(addr, "/") {
+		return true
+	}
+	return false
+}
 
 func LoadSysConfig(filename string) (*SysConfig, error) {
 	log.Printf("Loading system config from %s", filename)
@@ -282,7 +303,7 @@ func roundFloat(val float64, dec int) float64 {
 	return math.Round(val*pow) / pow
 }
 
-// Decimal规则处理：见下
+// Decimal规则处理
 func processValueForDecimal(raw interface{}, dtype string, decimal int) float64 {
 	if decimal < 0 {
 		decimal = 0
@@ -305,45 +326,107 @@ func processValueForDecimal(raw interface{}, dtype string, decimal int) float64 
 	}
 }
 
+// runBatchTask 修改后：支持 RTU 和 TCP 自动切换
 func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*TaskStatus, wg *sync.WaitGroup, influxW *InfluxWriter) {
 	defer wg.Done()
-	handler := modbus.NewTCPClientHandler(fmt.Sprintf("%s:%s", batch.IP, batch.Port))
-	handler.Timeout = 3 * time.Second
-	handler.SlaveId = batch.SlaveID
-	client := modbus.NewClient(handler)
+
+	// 1. 判断是否为串口模式
+	isRTU := isSerialPort(batch.IP)
+
+	// 如果是 RTU，我们需要获取该串口的互斥锁
+	var portLock *sync.Mutex
+	if isRTU {
+		portLock = getSerialLock(batch.IP)
+	}
+
+	var client modbus.Client
+	var tcpHandler *modbus.TCPClientHandler
+	var rtuHandler *modbus.RTUClientHandler
+
+	// 如果是 TCP，预先创建 Handler 并复用
+	if !isRTU {
+		tcpHandler = modbus.NewTCPClientHandler(fmt.Sprintf("%s:%s", batch.IP, batch.Port))
+		tcpHandler.Timeout = 3 * time.Second
+		tcpHandler.SlaveId = batch.SlaveID
+		client = modbus.NewClient(tcpHandler)
+	}
+
 	retry := 0
 
 	for {
 		select {
 		case <-ctx.Done():
-			handler.Close()
+			if tcpHandler != nil {
+				tcpHandler.Close()
+			}
 			log.Printf("Batch task %s stopped", batch.GroupKey)
 			return
 		default:
 			startTime := time.Now()
-			if err := handler.Connect(); err != nil {
+			var connectErr error
+
+			if isRTU {
+				// === RTU 模式 ===
+				// 1. 获取锁（阻塞直到其他任务释放该串口）
+				portLock.Lock()
+
+				// 2. 配置 RTU 参数
+				rtuHandler = modbus.NewRTUClientHandler(batch.IP)
+				// 解析波特率，复用 Port 字段
+				baud, _ := strconv.Atoi(batch.Port)
+				if baud == 0 {
+					baud = 9600 // 默认波特率
+				}
+				rtuHandler.BaudRate = baud
+				rtuHandler.DataBits = 8
+				rtuHandler.Parity = "N"
+				rtuHandler.StopBits = 1
+				rtuHandler.SlaveId = batch.SlaveID
+				rtuHandler.Timeout = 3 * time.Second
+
+				client = modbus.NewClient(rtuHandler)
+				connectErr = rtuHandler.Connect()
+			} else {
+				// === TCP 模式 ===
+				// TCPHandler 内部维护连接状态，调用 Connect 会尝试重连
+				connectErr = tcpHandler.Connect()
+			}
+
+			if connectErr != nil {
+				// 连接失败处理
 				for _, cfg := range batch.Items {
-					statusMap[cfg.VarName].LastError = err
+					statusMap[cfg.VarName].LastError = connectErr
 					statusMap[cfg.VarName].RetryCount = retry
 				}
-				log.Printf("MODBUS connect error: %v", err)
+				log.Printf("[%s] Connect error: %v", batch.IP, connectErr)
 				retry++
+
+				// 如果是 RTU，出错也要记得解锁！
+				if isRTU {
+					portLock.Unlock()
+				}
+
 				time.Sleep(1 * time.Second)
 				continue
 			}
+
+			// ============ 读取阶段 ============
 			totalBytes := int(batch.TotalQty) * 2
 			buffer := make([]byte, totalBytes)
 			addr := batch.StartAddr
 			remain := batch.TotalQty
 			offset := 0
 			var err error
+
 			for remain > 0 {
 				qty := remain
 				if qty > uint16(sysConfig.ModbusMaxRegs) {
 					qty = uint16(sysConfig.ModbusMaxRegs)
 				}
-				log.Printf("[MODBUS] Read %s:%s slave=%d func=%s addr=%d qty=%d",
-					batch.IP, batch.Port, batch.SlaveID, batch.FuncCode, addr, qty)
+
+				log.Printf("[MODBUS] Read %s:%s slave=%d func=%s addr=%d qty=%d (RTU=%v)",
+					batch.IP, batch.Port, batch.SlaveID, batch.FuncCode, addr, qty, isRTU)
+
 				var data []byte
 				switch batch.FuncCode {
 				case "HoldingReg", "03":
@@ -355,28 +438,43 @@ func runBatchTask(ctx context.Context, batch BatchTask, statusMap map[string]*Ta
 				case "DiscreteInput", "02":
 					data, err = client.ReadDiscreteInputs(addr, qty)
 				default:
-					for _, cfg := range batch.Items {
-						statusMap[cfg.VarName].LastError = fmt.Errorf("unsupported FuncCode: %s", batch.FuncCode)
-					}
-					log.Printf("Unsupported FuncCode: %s", batch.FuncCode)
+					err = fmt.Errorf("unsupported FuncCode: %s", batch.FuncCode)
+				}
+
+				if err != nil {
 					break
 				}
-				if err != nil {
-					for _, cfg := range batch.Items {
-						statusMap[cfg.VarName].LastError = err
-						statusMap[cfg.VarName].RetryCount = retry
-					}
-					handler.Close()
-					log.Printf("MODBUS read error: %v", err)
-					retry++
-					time.Sleep(1 * time.Second)
-					continue
-				}
+
 				copy(buffer[offset:offset+len(data)], data)
 				offset += len(data)
 				addr += qty
 				remain -= qty
 			}
+
+			// ============ 收尾阶段 (关键：RTU必须解锁) ============
+
+			if isRTU {
+				// RTU 采集完毕（无论成功失败），立即关闭并解锁，释放总线给其他从站
+				rtuHandler.Close()
+				portLock.Unlock()
+			}
+
+			if err != nil {
+				// 统一处理读取错误
+				for _, cfg := range batch.Items {
+					statusMap[cfg.VarName].LastError = err
+					statusMap[cfg.VarName].RetryCount = retry
+				}
+				if !isRTU {
+					tcpHandler.Close() // TCP出错断开连接
+				}
+				log.Printf("MODBUS read error: %v", err)
+				retry++
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			// ============ 数据解析与存储 (保持原逻辑不变) ============
 			curReg := 0
 			row := make(map[string]interface{})
 			for _, cfg := range batch.Items {
